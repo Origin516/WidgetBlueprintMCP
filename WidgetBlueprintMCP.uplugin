@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Widget Blueprint MCP",
+	"Description": "MCP server for reading and modifying Widget Blueprints via Claude AI",
+	"Category": "Editor",
+	"CreatedBy": "Origin516",
+	"CanContainContent": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "WidgetBlueprintMCP",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
