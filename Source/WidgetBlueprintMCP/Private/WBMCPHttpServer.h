@@ -17,17 +17,18 @@ public:
 	void Start(uint32 Port);
 	void Stop();
 
-private:
 	// Route handler for POST /mcp
 	bool HandleMcpRequest(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
-
+	
+	// Shared JSON-RPC processing — called by SSE server too
+	static FString ProcessJsonRpcBody(const FString& Body);
+	
+private:
 	// JSON-RPC method dispatchers (static — no instance state)
 	static TSharedPtr<FJsonObject> HandleInitialize(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonObject> HandleToolsList(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonObject> HandleToolsCall(const TSharedPtr<FJsonObject>& Params);
 
-	// Shared JSON-RPC processing — called by SSE server too
-	static FString ProcessJsonRpcBody(const FString& Body);
 
 	// Helpers
 	static TUniquePtr<FHttpServerResponse> MakeJsonResponse(const FString& Body, int32 StatusCode = 200);
