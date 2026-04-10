@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "Widget Blueprint MCP",
-	"Description": "MCP server for reading and modifying Widget Blueprints via Claude AI",
+	"Description": "A UMG-focused Unreal Editor plugin that exposes Widget Blueprint inspection, editing, compile, and save workflows over an MCP-style HTTP interface.",
 	"Category": "Editor",
 	"CreatedBy": "Origin516",
 	"CanContainContent": false,
