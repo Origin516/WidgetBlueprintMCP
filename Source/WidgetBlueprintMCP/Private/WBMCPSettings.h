@@ -22,6 +22,15 @@ public:
 	virtual FName GetCategoryName() const override  { return TEXT("Plugins"); }
 	virtual FName GetSectionName() const override   { return TEXT("WidgetBlueprintMCP"); }
 
+	// Port for the direct HTTP POST endpoint (used by Claude Code / curl)
 	UPROPERTY(config, EditAnywhere, Category = "WidgetBlueprintMCP", meta = (ClampMin = "1", ClampMax = "65535"))
 	int32 Port = 8765;
+
+	// Port for the SSE transport endpoint (used by Claude Desktop)
+	UPROPERTY(config, EditAnywhere, Category = "WidgetBlueprintMCP", meta = (ClampMin = "1", ClampMax = "65535"))
+	int32 SsePort = 8766;
+
+	// Enable the SSE transport server
+	UPROPERTY(config, EditAnywhere, Category = "WidgetBlueprintMCP")
+	bool bEnableSse = true;
 };

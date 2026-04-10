@@ -17,6 +17,7 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::Dispatch(const FString& ToolName, co
 {
 	if (ToolName == TEXT("list_widget_blueprints"))  return HandleListWidgetBlueprints(Args);
 	if (ToolName == TEXT("get_widget_blueprint"))    return HandleGetWidgetBlueprint(Args);
+	if (ToolName == TEXT("get_animation"))           return HandleGetAnimation(Args);
 	if (ToolName == TEXT("list_functions"))          return HandleListFunctions(Args);
 	if (ToolName == TEXT("get_function_graph"))      return HandleGetFunctionGraph(Args);
 	if (ToolName == TEXT("modify_widget_property"))  return HandleModifyWidgetProperty(Args);
@@ -28,6 +29,11 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::Dispatch(const FString& ToolName, co
 	if (ToolName == TEXT("connect_pins"))            return HandleConnectPins(Args);
 	if (ToolName == TEXT("disconnect_pins"))         return HandleDisconnectPins(Args);
 	if (ToolName == TEXT("remove_node"))             return HandleRemoveNode(Args);
+	if (ToolName == TEXT("compile_widget_blueprint")) return HandleCompileWidgetBlueprint(Args);
+	if (ToolName == TEXT("add_variable"))          return HandleAddVariable(Args);
+	if (ToolName == TEXT("set_variable_default"))  return HandleSetVariableDefault(Args);
+	if (ToolName == TEXT("modify_variable_flags")) return HandleModifyVariableFlags(Args);
+	if (ToolName == TEXT("remove_variable"))       return HandleRemoveVariable(Args);
 	if (ToolName == TEXT("execute_batch"))          return HandleExecuteBatch(Args);
 
 	return MakeTextResult(FString::Printf(TEXT("Tool '%s' is not yet implemented."), *ToolName), true);
@@ -137,7 +143,11 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleGetFunctionGraph(const TShared
 	TSharedPtr<FJsonObject> Data = FWBMCPSerializer::FunctionGraphToJson(Blueprint, GraphName);
 	if (!Data.IsValid())
 	{
-		return MakeTextResult(FString::Printf(TEXT("Graph not found: %s"), *GraphName), true);
+		TArray<FString> Available;
+		for (UEdGraph* G : Blueprint->UbergraphPages) { if (G) Available.Add(G->GetName()); }
+		for (UEdGraph* G : Blueprint->FunctionGraphs)  { if (G) Available.Add(G->GetName()); }
+		return MakeTextResult(FString::Printf(TEXT("Graph not found: '%s'. Available: %s"),
+			*GraphName, *FString::Join(Available, TEXT(", "))), true);
 	}
 
 	// Save snapshot for human inspection
@@ -145,6 +155,44 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleGetFunctionGraph(const TShared
 	TSharedRef<TJsonWriter<>> SnapWriter = TJsonWriterFactory<>::Create(&SnapshotJson);
 	FJsonSerializer::Serialize(Data.ToSharedRef(), SnapWriter);
 	FString SnapFileName = AssetPath.Replace(TEXT("/"), TEXT("_")) + TEXT("__") + GraphName + TEXT(".json");
+	SaveJsonSnapshot(SnapFileName, SnapshotJson);
+
+	return MakeJsonResult(Data);
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleGetAnimation(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath, AnimationName;
+	if (!Args.IsValid()
+		|| !Args->TryGetStringField(TEXT("asset_path"), AssetPath)
+		|| !Args->TryGetStringField(TEXT("animation_name"), AnimationName))
+	{
+		return MakeTextResult(TEXT("Missing required arguments: asset_path, animation_name"), true);
+	}
+
+	UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+	if (!Blueprint)
+	{
+		return MakeTextResult(FString::Printf(TEXT("Widget Blueprint not found: %s"), *AssetPath), true);
+	}
+
+	TSharedPtr<FJsonObject> Data = FWBMCPSerializer::GetAnimationDetail(Blueprint, AnimationName);
+	if (!Data.IsValid())
+	{
+		TArray<FString> Available;
+		for (UWidgetAnimation* Anim : Blueprint->Animations)
+		{
+			if (Anim) Available.Add(Anim->GetName());
+		}
+		return MakeTextResult(FString::Printf(TEXT("Animation not found: '%s'. Available: %s"),
+			*AnimationName, *FString::Join(Available, TEXT(", "))), true);
+	}
+
+	// Save snapshot
+	FString SnapshotJson;
+	TSharedRef<TJsonWriter<>> SnapWriter = TJsonWriterFactory<>::Create(&SnapshotJson);
+	FJsonSerializer::Serialize(Data.ToSharedRef(), SnapWriter);
+	FString SnapFileName = AssetPath.Replace(TEXT("/"), TEXT("_")) + TEXT("__anim__") + AnimationName + TEXT(".json");
 	SaveJsonSnapshot(SnapFileName, SnapshotJson);
 
 	return MakeJsonResult(Data);
@@ -209,6 +257,40 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleSaveWidgetBlueprint(const TSha
 		return MakeTextResult(Error, true);
 	}
 	return MakeTextResult(TEXT("OK"));
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleCompileWidgetBlueprint(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath;
+	if (!Args.IsValid() || !Args->TryGetStringField(TEXT("asset_path"), AssetPath))
+	{
+		return MakeTextResult(TEXT("Missing required argument: asset_path"), true);
+	}
+
+	TArray<FString> Errors, Warnings;
+	FString Error = FWBMCPModifier::CompileWidgetBlueprint(AssetPath, Errors, Warnings);
+	if (!Error.IsEmpty() && Error != TEXT("COMPILE_ERROR"))
+	{
+		return MakeTextResult(Error, true);
+	}
+
+	bool bSuccess = (Error != TEXT("COMPILE_ERROR"));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), bSuccess);
+
+	TArray<TSharedPtr<FJsonValue>> ErrorsArr, WarningsArr;
+	for (const FString& E : Errors)   ErrorsArr.Add(MakeShared<FJsonValueString>(E));
+	for (const FString& W : Warnings) WarningsArr.Add(MakeShared<FJsonValueString>(W));
+	Result->SetArrayField(TEXT("errors"), ErrorsArr);
+	Result->SetArrayField(TEXT("warnings"), WarningsArr);
+
+	FString Summary = bSuccess
+		? FString::Printf(TEXT("Compile OK. Warnings: %d"), Warnings.Num())
+		: FString::Printf(TEXT("Compile FAILED. Errors: %d, Warnings: %d"), Errors.Num(), Warnings.Num());
+	Result->SetStringField(TEXT("summary"), Summary);
+
+	return MakeJsonResult(Result);
 }
 
 TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleAddWidget(const TSharedPtr<FJsonObject>& Args)
@@ -310,6 +392,68 @@ TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleRemoveNode(const TSharedPtr<FJ
 	}
 
 	FString Error = FWBMCPModifier::RemoveNode(AssetPath, GraphName, NodeId);
+	return Error.IsEmpty() ? MakeTextResult(TEXT("OK")) : MakeTextResult(Error, true);
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleAddVariable(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath, VarName, VarType, Category;
+	if (!Args.IsValid()
+		|| !Args->TryGetStringField(TEXT("asset_path"), AssetPath)
+		|| !Args->TryGetStringField(TEXT("var_name"), VarName)
+		|| !Args->TryGetStringField(TEXT("var_type"), VarType))
+	{
+		return MakeTextResult(TEXT("Missing required arguments: asset_path, var_name, var_type"), true);
+	}
+	Args->TryGetStringField(TEXT("category"), Category);
+
+	FString Error = FWBMCPModifier::AddVariable(AssetPath, VarName, VarType, Category);
+	return Error.IsEmpty() ? MakeTextResult(TEXT("OK")) : MakeTextResult(Error, true);
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleSetVariableDefault(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath, VarName, DefaultValue;
+	if (!Args.IsValid()
+		|| !Args->TryGetStringField(TEXT("asset_path"), AssetPath)
+		|| !Args->TryGetStringField(TEXT("var_name"), VarName)
+		|| !Args->TryGetStringField(TEXT("default_value"), DefaultValue))
+	{
+		return MakeTextResult(TEXT("Missing required arguments: asset_path, var_name, default_value"), true);
+	}
+
+	FString Error = FWBMCPModifier::SetVariableDefault(AssetPath, VarName, DefaultValue);
+	return Error.IsEmpty() ? MakeTextResult(TEXT("OK")) : MakeTextResult(Error, true);
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleModifyVariableFlags(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath, VarName;
+	bool bInstanceEditable = true, bExposeOnSpawn = false;
+	if (!Args.IsValid()
+		|| !Args->TryGetStringField(TEXT("asset_path"), AssetPath)
+		|| !Args->TryGetStringField(TEXT("var_name"), VarName))
+	{
+		return MakeTextResult(TEXT("Missing required arguments: asset_path, var_name"), true);
+	}
+	Args->TryGetBoolField(TEXT("instance_editable"), bInstanceEditable);
+	Args->TryGetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawn);
+
+	FString Error = FWBMCPModifier::ModifyVariableFlags(AssetPath, VarName, bInstanceEditable, bExposeOnSpawn);
+	return Error.IsEmpty() ? MakeTextResult(TEXT("OK")) : MakeTextResult(Error, true);
+}
+
+TSharedPtr<FJsonObject> FWBMCPToolHandlers::HandleRemoveVariable(const TSharedPtr<FJsonObject>& Args)
+{
+	FString AssetPath, VarName;
+	if (!Args.IsValid()
+		|| !Args->TryGetStringField(TEXT("asset_path"), AssetPath)
+		|| !Args->TryGetStringField(TEXT("var_name"), VarName))
+	{
+		return MakeTextResult(TEXT("Missing required arguments: asset_path, var_name"), true);
+	}
+
+	FString Error = FWBMCPModifier::RemoveVariable(AssetPath, VarName);
 	return Error.IsEmpty() ? MakeTextResult(TEXT("OK")) : MakeTextResult(Error, true);
 }
 

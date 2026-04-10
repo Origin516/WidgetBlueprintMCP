@@ -25,6 +25,9 @@ public:
 	// Serialize a single graph (event graph or function) by name
 	static TSharedPtr<FJsonObject> FunctionGraphToJson(UWidgetBlueprint* Blueprint, const FString& GraphName);
 
+	// Detailed animation data: possessables, tracks, keys
+	static TSharedPtr<FJsonObject> GetAnimationDetail(UWidgetBlueprint* Blueprint, const FString& AnimationName);
+
 private:
 	// Widget tree
 	static TSharedPtr<FJsonObject> WidgetToJson(UWidget* Widget);

@@ -9,13 +9,22 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraph/EdGraphSchema.h"
+#include "EdGraphSchema_K2.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_DoOnceMultiInput.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_ExecutionSequence.h"
+#include "K2Node_IfThenElse.h"
+#include "K2Node_Variable.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/CompilerResultsLog.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
-#include "Containers/Ticker.h"
+#include "WBMCPCompat.h"
 #include "UObject/Package.h"
 #include "UObject/UnrealType.h"
 #include "WidgetBlueprint.h"
@@ -153,29 +162,22 @@ FString FWBMCPModifier::ModifyNodePin(
 FString FWBMCPModifier::SaveWidgetBlueprint(const FString& AssetPath)
 {
     // SavePackage must not block the HTTP handler tick (re-entrant deadlock).
-    // Defer to next GameThread tick and return immediately.
+    // Defer to next GameThread tick via FWBMCPCompat::DeferToNextTick.
     FString CapturedPath = AssetPath;
     RunOnGameThread([CapturedPath]()
     {
-        FTicker::GetCoreTicker().AddTicker(
-            FTickerDelegate::CreateLambda([CapturedPath](float) -> bool
+        FWBMCPCompat::DeferToNextTick([CapturedPath]()
+        {
+            UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *CapturedPath);
+            if (Blueprint)
             {
-                UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *CapturedPath);
-                if (Blueprint)
-                {
-                    UPackage* Pkg = Blueprint->GetOutermost();
-                    FString Filename = FPackageName::LongPackageNameToFilename(
-                        Pkg->GetName(),
-                        FPackageName::GetAssetPackageExtension());
-                    // Release memory-mapped file handle, force writable (no source control checkout)
-                    ResetLoaders(Pkg);
-                    FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*Filename, false);
-                    UPackage::SavePackage(Pkg, Blueprint, RF_Public | RF_Standalone, *Filename,
-                        nullptr, nullptr, false, true, SAVE_None, nullptr, FDateTime::MinValue(), false);
-                }
-                return false;
-            }),
-            0.0f);
+                UPackage* Pkg = Blueprint->GetOutermost();
+                FString Filename = FPackageName::LongPackageNameToFilename(
+                    Pkg->GetName(),
+                    FPackageName::GetAssetPackageExtension());
+                FWBMCPCompat::SavePackageForce(Pkg, Blueprint, Filename);
+            }
+        });
     });
     return TEXT("");
 }
@@ -327,16 +329,47 @@ FString FWBMCPModifier::AddNode(
 		{
 			FString VarName;
 			Params->TryGetStringField(TEXT("variable_name"), VarName);
-
 			UK2Node_VariableSet* VarNode = NewObject<UK2Node_VariableSet>(TargetGraph);
 			FMemberReference Ref;
 			Ref.SetSelfMember(FName(*VarName));
 			VarNode->VariableReference = Ref;
 			NewNode = VarNode;
 		}
+		else if (NodeType == TEXT("Branch"))
+		{
+			NewNode = NewObject<UK2Node_IfThenElse>(TargetGraph);
+		}
+		else if (NodeType == TEXT("Sequence"))
+		{
+			NewNode = NewObject<UK2Node_ExecutionSequence>(TargetGraph);
+		}
+		else if (NodeType == TEXT("CustomEvent"))
+		{
+			FString EventName;
+			Params->TryGetStringField(TEXT("event_name"), EventName);
+			UK2Node_CustomEvent* EventNode = NewObject<UK2Node_CustomEvent>(TargetGraph);
+			EventNode->CustomFunctionName = FName(*EventName);
+			NewNode = EventNode;
+		}
+		else if (NodeType == TEXT("Cast"))
+		{
+			FString TargetClassName;
+			Params->TryGetStringField(TEXT("target_class"), TargetClassName);
+			UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(TargetGraph);
+			if (!TargetClassName.IsEmpty())
+			{
+				UClass* TargetClass = FindObject<UClass>(ANY_PACKAGE, *TargetClassName);
+				if (TargetClass) CastNode->TargetType = TargetClass;
+			}
+			NewNode = CastNode;
+		}
+		else if (NodeType == TEXT("DoOnce"))
+		{
+			NewNode = NewObject<UK2Node_DoOnceMultiInput>(TargetGraph);
+		}
 		else
 		{
-			Result = FString::Printf(TEXT("Unsupported node type: %s"), *NodeType);
+			Result = FString::Printf(TEXT("Unsupported node type: %s. Supported: CallFunction, VariableGet, VariableSet, Branch, Sequence, CustomEvent, Cast, DoOnce"), *NodeType);
 			return;
 		}
 
@@ -461,4 +494,205 @@ FString FWBMCPModifier::RemoveNode(
 		Blueprint->MarkPackageDirty();
 	});
 	return Result;
+}
+
+FString FWBMCPModifier::CompileWidgetBlueprint(const FString& AssetPath, TArray<FString>& OutErrors, TArray<FString>& OutWarnings)
+{
+    FString Result;
+    RunOnGameThread([&]()
+    {
+        UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint)
+        {
+            Result = FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath);
+            return;
+        }
+
+        FCompilerResultsLog ResultsLog;
+        ResultsLog.bLogDetailedResults = false;
+        FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipSave, &ResultsLog);
+
+        for (const TSharedRef<FTokenizedMessage>& Msg : ResultsLog.Messages)
+        {
+            EMessageSeverity::Type Severity = Msg->GetSeverity();
+            FString Text = Msg->ToText().ToString();
+            if (Severity == EMessageSeverity::Error || Severity == EMessageSeverity::CriticalError)
+            {
+                OutErrors.Add(Text);
+            }
+            else if (Severity == EMessageSeverity::Warning || Severity == EMessageSeverity::PerformanceWarning)
+            {
+                OutWarnings.Add(Text);
+            }
+        }
+
+        if (Blueprint->Status == BS_Error)
+        {
+            Result = TEXT("COMPILE_ERROR");
+        }
+    });
+    return Result;
+}
+
+FString FWBMCPModifier::AddVariable(
+    const FString& AssetPath,
+    const FString& VarName,
+    const FString& VarType,
+    const FString& Category)
+{
+    FString Result;
+    RunOnGameThread([&]()
+    {
+        UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint) { Result = FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath); return; }
+
+        // Map type string to FEdGraphPinType
+        FEdGraphPinType PinType;
+        if      (VarType == TEXT("bool"))   { PinType.PinCategory = UEdGraphSchema_K2::PC_Boolean; }
+        else if (VarType == TEXT("int"))    { PinType.PinCategory = UEdGraphSchema_K2::PC_Int; }
+        else if (VarType == TEXT("float"))  { PinType.PinCategory = UEdGraphSchema_K2::PC_Float; }
+        else if (VarType == TEXT("string")) { PinType.PinCategory = UEdGraphSchema_K2::PC_String; }
+        else if (VarType == TEXT("text"))   { PinType.PinCategory = UEdGraphSchema_K2::PC_Text; }
+        else if (VarType == TEXT("name"))   { PinType.PinCategory = UEdGraphSchema_K2::PC_Name; }
+        else                               { PinType.PinCategory = UEdGraphSchema_K2::PC_String; }
+
+        // Check name not already used
+        for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarName.ToString() == VarName)
+            {
+                Result = FString::Printf(TEXT("Variable already exists: %s"), *VarName);
+                return;
+            }
+        }
+
+        FBlueprintEditorUtils::AddMemberVariable(Blueprint, FName(*VarName), PinType);
+
+        // Set category if provided
+        if (!Category.IsEmpty())
+        {
+            for (FBPVariableDescription& Var : Blueprint->NewVariables)
+            {
+                if (Var.VarName.ToString() == VarName)
+                {
+                    Var.Category = FText::FromString(Category);
+                    break;
+                }
+            }
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        Blueprint->MarkPackageDirty();
+    });
+    return Result;
+}
+
+FString FWBMCPModifier::SetVariableDefault(
+    const FString& AssetPath,
+    const FString& VarName,
+    const FString& DefaultValue)
+{
+    FString Result;
+    RunOnGameThread([&]()
+    {
+        UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint) { Result = FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath); return; }
+
+        bool bFound = false;
+        for (FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarName.ToString() == VarName)
+            {
+                Var.DefaultValue = DefaultValue;
+                bFound = true;
+                break;
+            }
+        }
+
+        if (!bFound)
+        {
+            TArray<FString> Names;
+            for (const FBPVariableDescription& V : Blueprint->NewVariables) Names.Add(V.VarName.ToString());
+            Result = FString::Printf(TEXT("Variable not found: '%s'. Available: %s"), *VarName, *FString::Join(Names, TEXT(", ")));
+            return;
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        Blueprint->MarkPackageDirty();
+    });
+    return Result;
+}
+
+FString FWBMCPModifier::ModifyVariableFlags(
+    const FString& AssetPath,
+    const FString& VarName,
+    bool bInstanceEditable,
+    bool bExposeOnSpawn)
+{
+    FString Result;
+    RunOnGameThread([&]()
+    {
+        UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint) { Result = FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath); return; }
+
+        bool bFound = false;
+        for (FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarName.ToString() == VarName)
+            {
+                if (bInstanceEditable)
+                    Var.PropertyFlags &= ~CPF_DisableEditOnInstance;
+                else
+                    Var.PropertyFlags |= CPF_DisableEditOnInstance;
+
+                if (bExposeOnSpawn)
+                    Var.PropertyFlags |= CPF_ExposeOnSpawn;
+                else
+                    Var.PropertyFlags &= ~CPF_ExposeOnSpawn;
+
+                bFound = true;
+                break;
+            }
+        }
+
+        if (!bFound)
+        {
+            TArray<FString> Names;
+            for (const FBPVariableDescription& V : Blueprint->NewVariables) Names.Add(V.VarName.ToString());
+            Result = FString::Printf(TEXT("Variable not found: '%s'. Available: %s"), *VarName, *FString::Join(Names, TEXT(", ")));
+            return;
+        }
+
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        Blueprint->MarkPackageDirty();
+    });
+    return Result;
+}
+
+FString FWBMCPModifier::RemoveVariable(const FString& AssetPath, const FString& VarName)
+{
+    FString Result;
+    RunOnGameThread([&]()
+    {
+        UWidgetBlueprint* Blueprint = LoadObject<UWidgetBlueprint>(nullptr, *AssetPath);
+        if (!Blueprint) { Result = FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath); return; }
+
+        bool bFound = false;
+        for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+        {
+            if (Var.VarName.ToString() == VarName) { bFound = true; break; }
+        }
+
+        if (!bFound)
+        {
+            TArray<FString> Names;
+            for (const FBPVariableDescription& V : Blueprint->NewVariables) Names.Add(V.VarName.ToString());
+            Result = FString::Printf(TEXT("Variable not found: '%s'. Available: %s"), *VarName, *FString::Join(Names, TEXT(", ")));
+            return;
+        }
+
+        FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, FName(*VarName));
+        Blueprint->MarkPackageDirty();
+    });
+    return Result;
 }

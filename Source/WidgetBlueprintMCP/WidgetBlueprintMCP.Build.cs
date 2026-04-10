@@ -28,8 +28,11 @@ public class WidgetBlueprintMCP : ModuleRules
 			"EditorSubsystem",
 			"DeveloperSettings",
 			"MovieScene",
+			"MovieSceneTracks",
 			"Slate",
 			"SlateCore",
+			"Networking",
+			"Sockets",
 		});
 	}
 }

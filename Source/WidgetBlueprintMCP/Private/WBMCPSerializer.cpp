@@ -16,6 +16,16 @@
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "UObject/UnrealType.h"
+#include "Animation/WidgetAnimationBinding.h"
+#include "MovieScene.h"
+#include "MovieSceneTrack.h"
+#include "MovieSceneSection.h"
+#include "Channels/MovieSceneFloatChannel.h"
+#include "Channels/MovieSceneBoolChannel.h"
+#include "Tracks/MovieSceneFloatTrack.h"
+#include "Tracks/MovieSceneBoolTrack.h"
+#include "Sections/MovieSceneFloatSection.h"
+#include "Sections/MovieSceneBoolSection.h"
 
 // ---------------------------------------------------------------------------
 // Public — full blueprint overview
@@ -438,4 +448,142 @@ FString FWBMCPSerializer::PinTypeToString(const FEdGraphPinType& PinType)
 		TypeStr += TEXT("(") + PinType.PinSubCategoryObject->GetName() + TEXT(")");
 	}
 	return TypeStr;
+}
+
+// ---------------------------------------------------------------------------
+// Public — animation detail
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FWBMCPSerializer::GetAnimationDetail(UWidgetBlueprint* Blueprint, const FString& AnimationName)
+{
+	if (!Blueprint) return nullptr;
+
+	UWidgetAnimation* TargetAnim = nullptr;
+	for (UWidgetAnimation* Anim : Blueprint->Animations)
+	{
+		if (Anim && Anim->GetName() == AnimationName)
+		{
+			TargetAnim = Anim;
+			break;
+		}
+	}
+	if (!TargetAnim) return nullptr;
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("name"), TargetAnim->GetName());
+
+	if (!TargetAnim->MovieScene)
+	{
+		Result->SetArrayField(TEXT("possessables"), TArray<TSharedPtr<FJsonValue>>());
+		return Result;
+	}
+
+	UMovieScene* Scene = TargetAnim->MovieScene;
+
+	// Duration
+	TRange<FFrameNumber> Range = Scene->GetPlaybackRange();
+	if (Range.HasLowerBound() && Range.HasUpperBound())
+	{
+		double TickRes = Scene->GetTickResolution().AsDecimal();
+		int32 DurationFrames = (Range.GetUpperBoundValue() - Range.GetLowerBoundValue()).Value;
+		float DurationSec = TickRes > 0.0 ? (float)(DurationFrames / TickRes) : 0.f;
+		Result->SetNumberField(TEXT("durationSeconds"), DurationSec);
+		Result->SetNumberField(TEXT("tickResolution"), TickRes);
+	}
+
+	// Build guid -> widget name map from AnimationBindings
+	TMap<FGuid, FString> GuidToWidget;
+	for (const FWidgetAnimationBinding& Binding : TargetAnim->AnimationBindings)
+	{
+		GuidToWidget.Add(Binding.AnimationGuid, Binding.WidgetName.ToString());
+	}
+
+	// Possessables and their tracks
+	TArray<TSharedPtr<FJsonValue>> PossessablesArr;
+	int32 PossessableCount = Scene->GetPossessableCount();
+	for (int32 i = 0; i < PossessableCount; ++i)
+	{
+		const FMovieScenePossessable& Possessable = Scene->GetPossessable(i);
+		FGuid PossGuid = Possessable.GetGuid();
+
+		TSharedPtr<FJsonObject> PossObj = MakeShared<FJsonObject>();
+		FString* WidgetName = GuidToWidget.Find(PossGuid);
+		PossObj->SetStringField(TEXT("name"), WidgetName ? *WidgetName : Possessable.GetName());
+		PossObj->SetStringField(TEXT("guid"), PossGuid.ToString());
+
+		// Tracks for this possessable
+		TArray<TSharedPtr<FJsonValue>> TracksArr;
+		for (const FMovieSceneBinding& SceneBinding : Scene->GetBindings())
+		{
+			if (SceneBinding.GetObjectGuid() != PossGuid) continue;
+			for (UMovieSceneTrack* Track : SceneBinding.GetTracks())
+			{
+				if (!Track) continue;
+				TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+				TrackObj->SetStringField(TEXT("trackClass"), Track->GetClass()->GetName());
+				TrackObj->SetStringField(TEXT("trackName"), Track->GetTrackName().ToString());
+
+				// Sections and keys
+				TArray<TSharedPtr<FJsonValue>> SectionsArr;
+				for (UMovieSceneSection* Section : Track->GetAllSections())
+				{
+					if (!Section) continue;
+					TSharedPtr<FJsonObject> SectionObj = MakeShared<FJsonObject>();
+
+					TRange<FFrameNumber> SRange = Section->GetRange();
+					if (SRange.HasLowerBound() && SRange.HasUpperBound())
+					{
+						double TickRes = Scene->GetTickResolution().AsDecimal();
+						SectionObj->SetNumberField(TEXT("startSec"), TickRes > 0.0 ? SRange.GetLowerBoundValue().Value / TickRes : 0.0);
+						SectionObj->SetNumberField(TEXT("endSec"),   TickRes > 0.0 ? SRange.GetUpperBoundValue().Value / TickRes : 0.0);
+					}
+
+					// Float channel keys
+					if (UMovieSceneFloatSection* FloatSec = Cast<UMovieSceneFloatSection>(Section))
+					{
+						const FMovieSceneFloatChannel& Chan = FloatSec->GetChannel();
+						TArray<TSharedPtr<FJsonValue>> KeysArr;
+						TArrayView<const FFrameNumber> Times  = Chan.GetTimes();
+						TArrayView<const FMovieSceneFloatValue> Values = Chan.GetValues();
+						double TickRes = Scene->GetTickResolution().AsDecimal();
+						for (int32 k = 0; k < Times.Num(); ++k)
+						{
+							TSharedPtr<FJsonObject> KeyObj = MakeShared<FJsonObject>();
+							KeyObj->SetNumberField(TEXT("timeSec"), TickRes > 0.0 ? Times[k].Value / TickRes : 0.0);
+							KeyObj->SetNumberField(TEXT("value"), Values[k].Value);
+							KeysArr.Add(MakeShared<FJsonValueObject>(KeyObj));
+						}
+						SectionObj->SetArrayField(TEXT("keys"), KeysArr);
+						SectionObj->SetStringField(TEXT("channelType"), TEXT("float"));
+					}
+					// Bool channel keys
+					else if (UMovieSceneBoolSection* BoolSec = Cast<UMovieSceneBoolSection>(Section))
+					{
+						const FMovieSceneBoolChannel& Chan = BoolSec->GetChannel();
+						TArray<TSharedPtr<FJsonValue>> KeysArr;
+						TArrayView<const FFrameNumber> Times  = Chan.GetTimes();
+						TArrayView<const bool>          Values = Chan.GetValues();
+						double TickRes = Scene->GetTickResolution().AsDecimal();
+						for (int32 k = 0; k < Times.Num(); ++k)
+						{
+							TSharedPtr<FJsonObject> KeyObj = MakeShared<FJsonObject>();
+							KeyObj->SetNumberField(TEXT("timeSec"), TickRes > 0.0 ? Times[k].Value / TickRes : 0.0);
+							KeyObj->SetBoolField(TEXT("value"), Values[k]);
+							KeysArr.Add(MakeShared<FJsonValueObject>(KeyObj));
+						}
+						SectionObj->SetArrayField(TEXT("keys"), KeysArr);
+						SectionObj->SetStringField(TEXT("channelType"), TEXT("bool"));
+					}
+
+					SectionsArr.Add(MakeShared<FJsonValueObject>(SectionObj));
+				}
+				TrackObj->SetArrayField(TEXT("sections"), SectionsArr);
+				TracksArr.Add(MakeShared<FJsonValueObject>(TrackObj));
+			}
+		}
+		PossObj->SetArrayField(TEXT("tracks"), TracksArr);
+		PossessablesArr.Add(MakeShared<FJsonValueObject>(PossObj));
+	}
+	Result->SetArrayField(TEXT("possessables"), PossessablesArr);
+	return Result;
 }

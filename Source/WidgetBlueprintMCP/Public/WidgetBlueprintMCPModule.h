@@ -3,6 +3,7 @@
 #include "Modules/ModuleManager.h"
 
 class FWBMCPHttpServer;
+class FWBMCPSseServer;
 
 DECLARE_LOG_CATEGORY_EXTERN(LogWidgetBlueprintMCP, Log, All);
 
@@ -14,4 +15,5 @@ public:
 
 private:
 	TSharedPtr<FWBMCPHttpServer> HttpServer;
+	TSharedPtr<FWBMCPSseServer>  SseServer;
 };

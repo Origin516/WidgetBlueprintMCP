@@ -56,24 +56,34 @@ void FWBMCPHttpServer::Stop()
 
 bool FWBMCPHttpServer::HandleMcpRequest(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
-	// Parse request body as JSON-RPC 2.0
 	if (Request.Body.Num() == 0)
 	{
 		OnComplete(MakeErrorResponse(-32700, TEXT("Empty request body"), TSharedPtr<FJsonValue>()));
 		return true;
 	}
-	// Add null terminator before converting — Request.Body is not null-terminated
 	TArray<uint8> BodyData = Request.Body;
 	BodyData.Add(0);
 	const FString Body = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(BodyData.GetData())));
 
+	OnComplete(MakeJsonResponse(ProcessJsonRpcBody(Body)));
+	return true;
+}
+
+FString FWBMCPHttpServer::ProcessJsonRpcBody(const FString& Body)
+{
 	TSharedPtr<FJsonObject> RequestJson;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Body);
 
 	if (!FJsonSerializer::Deserialize(Reader, RequestJson) || !RequestJson.IsValid())
 	{
-		OnComplete(MakeErrorResponse(-32700, TEXT("Parse error"), MakeShared<FJsonValueNull>()));
-		return true;
+		TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+		Err->SetNumberField(TEXT("code"), -32700);
+		Err->SetStringField(TEXT("message"), TEXT("Parse error"));
+		TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+		Resp->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
+		Resp->SetField(TEXT("id"), MakeShared<FJsonValueNull>());
+		Resp->SetObjectField(TEXT("error"), Err);
+		return SerializeJson(Resp);
 	}
 
 	TSharedPtr<FJsonValue> IdValue = RequestJson->TryGetField(TEXT("id"));
@@ -87,8 +97,12 @@ bool FWBMCPHttpServer::HandleMcpRequest(const FHttpServerRequest& Request, const
 		Params = *ParamsPtr;
 	}
 
-	TSharedPtr<FJsonObject> Result;
+	if (Method == TEXT("notifications/initialized"))
+	{
+		return TEXT("{}");
+	}
 
+	TSharedPtr<FJsonObject> Result;
 	if (Method == TEXT("initialize"))
 	{
 		Result = HandleInitialize(Params);
@@ -101,26 +115,23 @@ bool FWBMCPHttpServer::HandleMcpRequest(const FHttpServerRequest& Request, const
 	{
 		Result = HandleToolsCall(Params);
 	}
-	else if (Method == TEXT("notifications/initialized"))
-	{
-		// Notification — no response body required
-		OnComplete(MakeJsonResponse(TEXT("{}")));
-		return true;
-	}
 	else
 	{
-		OnComplete(MakeErrorResponse(-32601, FString::Printf(TEXT("Method not found: %s"), *Method), IdValue));
-		return true;
+		TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+		Err->SetNumberField(TEXT("code"), -32601);
+		Err->SetStringField(TEXT("message"), FString::Printf(TEXT("Method not found: %s"), *Method));
+		TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+		Resp->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
+		Resp->SetField(TEXT("id"), IdValue.IsValid() ? IdValue : MakeShared<FJsonValueNull>());
+		Resp->SetObjectField(TEXT("error"), Err);
+		return SerializeJson(Resp);
 	}
 
-	// Build JSON-RPC 2.0 response
 	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
 	Response->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
 	Response->SetField(TEXT("id"), IdValue.IsValid() ? IdValue : MakeShared<FJsonValueNull>());
 	Response->SetObjectField(TEXT("result"), Result);
-
-	OnComplete(MakeJsonResponse(SerializeJson(Response)));
-	return true;
+	return SerializeJson(Response);
 }
 
 TSharedPtr<FJsonObject> FWBMCPHttpServer::HandleInitialize(const TSharedPtr<FJsonObject>& Params)
@@ -171,11 +182,28 @@ TArray<TSharedPtr<FJsonValue>> FWBMCPHttpServer::BuildToolList()
 {
 	TArray<TSharedPtr<FJsonValue>> Tools;
 
-	auto MakeTool = [](const FString& Name, const FString& Description) -> TSharedPtr<FJsonValue>
+	// MSVC-safe: use local struct + std::initializer_list instead of TPair brace-init
+	struct FProp { const TCHAR* Name; const TCHAR* Type; };
+
+	auto MakeTool = [](const TCHAR* Name, const TCHAR* Description,
+		std::initializer_list<FProp> Props,
+		std::initializer_list<const TCHAR*> Required) -> TSharedPtr<FJsonValue>
 	{
+		TSharedPtr<FJsonObject> PropsObj = MakeShared<FJsonObject>();
+		for (const FProp& P : Props)
+		{
+			TSharedPtr<FJsonObject> PropDef = MakeShared<FJsonObject>();
+			PropDef->SetStringField(TEXT("type"), P.Type);
+			PropsObj->SetObjectField(P.Name, PropDef);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> RequiredArr;
+		for (const TCHAR* R : Required) RequiredArr.Add(MakeShared<FJsonValueString>(R));
+
 		TSharedPtr<FJsonObject> InputSchema = MakeShared<FJsonObject>();
 		InputSchema->SetStringField(TEXT("type"), TEXT("object"));
-		InputSchema->SetObjectField(TEXT("properties"), MakeShared<FJsonObject>());
+		InputSchema->SetObjectField(TEXT("properties"), PropsObj);
+		InputSchema->SetArrayField(TEXT("required"), RequiredArr);
 
 		TSharedPtr<FJsonObject> Tool = MakeShared<FJsonObject>();
 		Tool->SetStringField(TEXT("name"), Name);
@@ -184,20 +212,104 @@ TArray<TSharedPtr<FJsonValue>> FWBMCPHttpServer::BuildToolList()
 		return MakeShared<FJsonValueObject>(Tool);
 	};
 
-	Tools.Add(MakeTool(TEXT("list_widget_blueprints"),  TEXT("List all Widget Blueprints in the project")));
-	Tools.Add(MakeTool(TEXT("get_widget_blueprint"),    TEXT("Get the widget tree of a Widget Blueprint as JSON")));
-	Tools.Add(MakeTool(TEXT("modify_widget_property"),  TEXT("Modify a property on a widget")));
-	Tools.Add(MakeTool(TEXT("add_widget"),              TEXT("Add a new widget to the widget tree")));
-	Tools.Add(MakeTool(TEXT("remove_widget"),           TEXT("Remove a widget from the widget tree")));
-	Tools.Add(MakeTool(TEXT("list_functions"),          TEXT("List all functions and events in a Widget Blueprint")));
-	Tools.Add(MakeTool(TEXT("get_function_graph"),      TEXT("Get the node graph of a function as JSON")));
-	Tools.Add(MakeTool(TEXT("modify_node_pin"),         TEXT("Modify a pin's default value on a blueprint node")));
-	Tools.Add(MakeTool(TEXT("add_node"),                TEXT("Add a new node to a function graph")));
-	Tools.Add(MakeTool(TEXT("connect_pins"),            TEXT("Connect two pins in a function graph")));
-	Tools.Add(MakeTool(TEXT("disconnect_pins"),         TEXT("Disconnect two pins in a function graph")));
-	Tools.Add(MakeTool(TEXT("remove_node"),             TEXT("Remove a node from a function graph")));
-	Tools.Add(MakeTool(TEXT("save_widget_blueprint"),   TEXT("Save and compile a Widget Blueprint")));
-	Tools.Add(MakeTool(TEXT("execute_batch"), TEXT("Execute multiple MCP tool commands in sequence. Supports $id.node_id substitution from previous add_node results.")));
+	Tools.Add(MakeTool(TEXT("list_widget_blueprints"),
+		TEXT("List all Widget Blueprint asset paths in the project."),
+		{ {TEXT("path_filter"), TEXT("string")} }, {}));
+
+	Tools.Add(MakeTool(TEXT("get_widget_blueprint"),
+		TEXT("Get widget tree, variables, animations and graph names of a Widget Blueprint."),
+		{ {TEXT("asset_path"), TEXT("string")} },
+		{ TEXT("asset_path") }));
+
+	Tools.Add(MakeTool(TEXT("get_animation"),
+		TEXT("Get detailed animation data (possessables, tracks, keyframes) for a named animation in a Widget Blueprint."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("animation_name"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("animation_name") }));
+
+	Tools.Add(MakeTool(TEXT("list_functions"),
+		TEXT("List all event graphs, functions and macros in a Widget Blueprint."),
+		{ {TEXT("asset_path"), TEXT("string")} },
+		{ TEXT("asset_path") }));
+
+	Tools.Add(MakeTool(TEXT("get_function_graph"),
+		TEXT("Get the full node graph (nodes, pins, connections) of a function or event graph. Use node ids from here for modify/connect/remove operations."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name") }));
+
+	Tools.Add(MakeTool(TEXT("modify_widget_property"),
+		TEXT("Modify a property value on a widget in the widget tree."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("widget_name"), TEXT("string")}, {TEXT("property_name"), TEXT("string")}, {TEXT("value"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("widget_name"), TEXT("property_name"), TEXT("value") }));
+
+	Tools.Add(MakeTool(TEXT("modify_node_pin"),
+		TEXT("Set the default value of a pin on a blueprint graph node."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")}, {TEXT("node_id"), TEXT("string")}, {TEXT("pin_name"), TEXT("string")}, {TEXT("value"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name"), TEXT("node_id"), TEXT("pin_name"), TEXT("value") }));
+
+	Tools.Add(MakeTool(TEXT("add_widget"),
+		TEXT("Add a new widget to the widget tree."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("widget_class"), TEXT("string")}, {TEXT("widget_name"), TEXT("string")}, {TEXT("parent_widget"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("widget_class"), TEXT("widget_name") }));
+
+	Tools.Add(MakeTool(TEXT("remove_widget"),
+		TEXT("Remove a widget from the widget tree."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("widget_name"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("widget_name") }));
+
+	Tools.Add(MakeTool(TEXT("add_node"),
+		TEXT("Add a new node to a function graph. node_type: CallFunction|VariableGet|VariableSet|Branch|Sequence|CustomEvent|Cast|DoOnce. Returns node_id."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")}, {TEXT("node_type"), TEXT("string")}, {TEXT("x"), TEXT("number")}, {TEXT("y"), TEXT("number")}, {TEXT("params"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name"), TEXT("node_type") }));
+
+	Tools.Add(MakeTool(TEXT("connect_pins"),
+		TEXT("Connect two pins in a function graph. Get node_id and pin names from get_function_graph."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")}, {TEXT("source_node_id"), TEXT("string")}, {TEXT("source_pin"), TEXT("string")}, {TEXT("target_node_id"), TEXT("string")}, {TEXT("target_pin"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name"), TEXT("source_node_id"), TEXT("source_pin"), TEXT("target_node_id"), TEXT("target_pin") }));
+
+	Tools.Add(MakeTool(TEXT("disconnect_pins"),
+		TEXT("Disconnect two pins in a function graph."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")}, {TEXT("source_node_id"), TEXT("string")}, {TEXT("source_pin"), TEXT("string")}, {TEXT("target_node_id"), TEXT("string")}, {TEXT("target_pin"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name"), TEXT("source_node_id"), TEXT("source_pin"), TEXT("target_node_id"), TEXT("target_pin") }));
+
+	Tools.Add(MakeTool(TEXT("remove_node"),
+		TEXT("Remove a node from a function graph."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("graph_name"), TEXT("string")}, {TEXT("node_id"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("graph_name"), TEXT("node_id") }));
+
+	Tools.Add(MakeTool(TEXT("save_widget_blueprint"),
+		TEXT("Save a Widget Blueprint asset to disk."),
+		{ {TEXT("asset_path"), TEXT("string")} },
+		{ TEXT("asset_path") }));
+
+	Tools.Add(MakeTool(TEXT("compile_widget_blueprint"),
+		TEXT("Compile a Widget Blueprint. Returns success, errors[], warnings[]."),
+		{ {TEXT("asset_path"), TEXT("string")} },
+		{ TEXT("asset_path") }));
+
+	Tools.Add(MakeTool(TEXT("add_variable"),
+		TEXT("Add a new variable to a Widget Blueprint. var_type: string|bool|int|float|text|name"),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("var_name"), TEXT("string")}, {TEXT("var_type"), TEXT("string")}, {TEXT("category"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("var_name"), TEXT("var_type") }));
+
+	Tools.Add(MakeTool(TEXT("set_variable_default"),
+		TEXT("Set the default value of a variable in a Widget Blueprint."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("var_name"), TEXT("string")}, {TEXT("default_value"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("var_name"), TEXT("default_value") }));
+
+	Tools.Add(MakeTool(TEXT("modify_variable_flags"),
+		TEXT("Modify variable flags: instance_editable and expose_on_spawn."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("var_name"), TEXT("string")}, {TEXT("instance_editable"), TEXT("boolean")}, {TEXT("expose_on_spawn"), TEXT("boolean")} },
+		{ TEXT("asset_path"), TEXT("var_name") }));
+
+	Tools.Add(MakeTool(TEXT("remove_variable"),
+		TEXT("Remove a variable from a Widget Blueprint."),
+		{ {TEXT("asset_path"), TEXT("string")}, {TEXT("var_name"), TEXT("string")} },
+		{ TEXT("asset_path"), TEXT("var_name") }));
+
+	Tools.Add(MakeTool(TEXT("execute_batch"),
+		TEXT("Execute multiple MCP tool commands in sequence. Supports $id.node_id substitution from previous add_node results. stop_on_error defaults to true."),
+		{ {TEXT("commands"), TEXT("array")}, {TEXT("stop_on_error"), TEXT("boolean")} },
+		{ TEXT("commands") }));
 
 	return Tools;
 }

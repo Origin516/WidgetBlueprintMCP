@@ -23,6 +23,12 @@ public:
     static FString ConnectPins(const FString& AssetPath, const FString& GraphName, const FString& SourceNodeId, const FString& SourcePinName, const FString& TargetNodeId, const FString& TargetPinName);
     static FString DisconnectPins(const FString& AssetPath, const FString& GraphName, const FString& SourceNodeId, const FString& SourcePinName, const FString& TargetNodeId, const FString& TargetPinName);
     static FString RemoveNode(const FString& AssetPath, const FString& GraphName, const FString& NodeId);
+    static FString CompileWidgetBlueprint(const FString& AssetPath, TArray<FString>& OutErrors, TArray<FString>& OutWarnings);
+
+    static FString AddVariable(const FString& AssetPath, const FString& VarName, const FString& VarType, const FString& Category);
+    static FString SetVariableDefault(const FString& AssetPath, const FString& VarName, const FString& DefaultValue);
+    static FString ModifyVariableFlags(const FString& AssetPath, const FString& VarName, bool bInstanceEditable, bool bExposeOnSpawn);
+    static FString RemoveVariable(const FString& AssetPath, const FString& VarName);
 
 private:
     static void RunOnGameThread(TFunction<void()> Work);
